@@ -1290,6 +1290,9 @@ target_link_libraries(MAC_UE_NR PRIVATE asn1_lte_rrc_hdrs asn1_nr_rrc_hdrs PUBLI
 add_library(L2_LTE ${L2_LTE_SRC})
 target_link_libraries(L2_LTE PRIVATE asn1_lte_rrc_hdrs asn1_nr_rrc_hdrs)
 
+add_library(genann_nn ${OPENAIR2_DIR}/LAYER2/NR_MAC_gNB/genann/genann.c)
+target_include_directories(genann_nn PUBLIC ${OPENAIR2_DIR}/LAYER2/NR_MAC_gNB/genann)
+
 add_library(L2_NR
   ${L2_NR_SRC}
   ${MAC_NR_SRC}
@@ -1298,6 +1301,7 @@ add_library(L2_NR
 target_link_libraries(L2_NR PRIVATE ds alg)
 target_link_libraries(L2_NR PRIVATE f1ap_lib)
 target_link_libraries(L2_NR PRIVATE nfapi_vnf_lib)
+target_link_libraries(L2_NR PRIVATE genann_nn)
 target_include_directories(L2_NR PRIVATE ${F1AP_DIR}/lib)
 if(E2_AGENT)
   target_compile_definitions(L2_NR PRIVATE ${E2AP_VERSION} ${KPM_VERSION} E2_AGENT)

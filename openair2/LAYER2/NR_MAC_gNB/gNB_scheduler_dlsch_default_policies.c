@@ -14,6 +14,7 @@
 
 #include "common/utils/nr/nr_common.h"
 #include "gNB_scheduler_dlsch_default_policies.h"
+#include "genann.h"
 /*MAC*/
 #include "NR_MAC_COMMON/nr_mac.h"
 #include "NR_MAC_gNB/nr_mac_gNB.h"
@@ -185,6 +186,48 @@ static int compare_dl_pf_rb_ptrs(const void *a, const void *b)
 
 int nr_dl_proportional_fair(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates)
 {
+  FOR_EACH_CANDIDATE(cand, candidates, n_candidates)
+  if (!cand->skipped) {
+    order[n_active++] = cand;
+
+    /* ---- genann test: real inputs (avg_throughput, cqi) + timing ---- */
+    static genann *toy_nn = NULL;
+    static long long genann_total_ns = 0;
+    static int genann_call_count = 0;
+
+    if (!toy_nn) {
+      toy_nn = genann_init(2, 1, 8, 1);
+      LOG_I(NR_MAC, "[genann_test] toy network initialized (%d weights)\n", toy_nn->total_weights);
+    }
+
+    /* Basic normalization: keeps both inputs on a comparable scale.
+    * Not critical for this pure-timing test (no training happening),
+    * but important preparation: an un-normalized throughput in raw bps
+    * (up to tens of millions) next to a CQI of 0-15 would completely
+    * dominate the network's behavior once we start real training. */
+    double input[2];
+    input[0] = cand->avg_throughput / 1e6; /* bps -> Mbps-ish scale */
+    input[1] = cand->cqi / 15.0;           /* CQI 0-15 -> 0-1 */
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    double const *out = genann_run(toy_nn, input);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    long long elapsed_ns = (t1.tv_sec - t0.tv_sec) * 1000000000LL + (t1.tv_nsec - t0.tv_nsec);
+    genann_total_ns += elapsed_ns;
+    genann_call_count++;
+
+    if (genann_call_count % 128 == 0) {
+      LOG_I(NR_MAC,
+            "[genann_test] call #%d, RNTI %04x, avg_thr=%.3f Mbps, cqi=%d, output=%f, "
+            "last_inference=%lld ns, avg_inference=%lld ns\n",
+            genann_call_count, cand->rnti, cand->avg_throughput / 1e6, cand->cqi, out[0],
+            elapsed_ns, genann_total_ns / genann_call_count);
+    }
+    /* ---- end genann test ---- */
+  }
+
   const int min_rbSize = 5;
   int n_scheduled = 0;
 
