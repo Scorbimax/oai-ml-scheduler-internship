@@ -15,6 +15,8 @@
 #include "common/utils/nr/nr_common.h"
 #include "gNB_scheduler_dlsch_default_policies.h"
 #include "genann.h"
+#include <pthread.h>
+#include <unistd.h>
 /*MAC*/
 #include "NR_MAC_COMMON/nr_mac.h"
 #include "NR_MAC_gNB/nr_mac_gNB.h"
@@ -27,6 +29,78 @@
 /*Softmodem params*/
 #include "executables/softmodem-common.h"
 #include "../../../nfapi/oai_integration/vendor_ext.h"
+
+#define REPLAY_BUFFER_CAPACITY 10000  /* how much history the buffer holds */
+#define TRAIN_BATCH_SIZE 32          /* how many random samples per training round */
+
+/* One replay entry = one (state, target) pair captured from one slot.
+ * "target" is a placeholder for now (fixed 0.5) until a real reward
+ * signal is defined in a later step. */
+typedef struct {
+  double state[2];   /* avg_throughput (normalized), cqi (normalized) */
+  double target[1];  /* placeholder training target */
+} replay_sample_t;
+
+static replay_sample_t replay_buffer[REPLAY_BUFFER_CAPACITY];
+static int replay_write_idx = 0;   /* next slot to write into (circular) */
+static int replay_count = 0;       /* how many valid entries so far, caps at CAPACITY */
+static pthread_mutex_t replay_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static genann *shared_nn = NULL;
+static pthread_t training_thread_handle;
+static int training_thread_started = 0;
+
+/* ==================== background training thread ==================== */
+/* Runs independently of the real-time scheduler loop. Wakes up periodically,
+ * and if enough samples are available, draws a random batch and trains on it.
+ * This function never touches OAI's scheduling data structures directly -
+ * it only reads from the replay buffer, which is filled by the real-time
+ * thread. This keeps the two thread's responsibilities cleanly separated. */
+static void *genann_training_thread(void *arg) {
+  (void)arg;
+
+  while (1) {
+    usleep(10000); /* 10 ms between rounds - not time critical, can be tuned */
+
+    replay_sample_t batch[TRAIN_BATCH_SIZE];
+    int available;
+
+    /* Critical section: copy out a random batch under the lock, then
+     * release immediately. We do NOT train while holding the lock, so
+     * the real-time thread is never blocked for more than a few memcpy. */
+    pthread_mutex_lock(&replay_mutex);
+    available = replay_count;
+    if (available >= TRAIN_BATCH_SIZE) {
+      for (int i = 0; i < TRAIN_BATCH_SIZE; i++) {
+        int idx = rand() % available; /* random sample: breaks time correlation */
+        batch[i] = replay_buffer[idx];
+      }
+    }
+    pthread_mutex_unlock(&replay_mutex);
+
+    if (available < TRAIN_BATCH_SIZE) {
+      continue; /* buffer not filled enough yet, wait for more data */
+    }
+
+    /* Actual training happens outside the lock, on our local copy of the
+     * batch. This is where the "no lock on weights" trade-off applies:
+     * the real-time thread may call genann_run() concurrently while we
+     * write into shared_nn's weights here. */
+    struct timespec bt0, bt1;
+    clock_gettime(CLOCK_MONOTONIC, &bt0);
+    for (int i = 0; i < TRAIN_BATCH_SIZE; i++) {
+      genann_train(shared_nn, batch[i].state, batch[i].target, 0.05);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &bt1);
+
+    long long elapsed_ns = (bt1.tv_sec - bt0.tv_sec) * 1000000000LL + (bt1.tv_nsec - bt0.tv_nsec);
+    LOG_I(NR_MAC,
+          "[genann_test] BACKGROUND TRAIN: batch=%d, took=%lld ns, buffer_fill=%d/%d\n",
+          TRAIN_BATCH_SIZE, elapsed_ns, available, REPLAY_BUFFER_CAPACITY);
+  }
+
+  return NULL; /* never reached in practice, thread runs forever */
+}
 
 // Default RI/PMI selector: reads rank and PMI from CSI feedback for new-tx,
 // or from HARQ process state for retx.
@@ -186,48 +260,6 @@ static int compare_dl_pf_rb_ptrs(const void *a, const void *b)
 
 int nr_dl_proportional_fair(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates)
 {
-  FOR_EACH_CANDIDATE(cand, candidates, n_candidates)
-  if (!cand->skipped) {
-    order[n_active++] = cand;
-
-    /* ---- genann test: real inputs (avg_throughput, cqi) + timing ---- */
-    static genann *toy_nn = NULL;
-    static long long genann_total_ns = 0;
-    static int genann_call_count = 0;
-
-    if (!toy_nn) {
-      toy_nn = genann_init(2, 1, 8, 1);
-      LOG_I(NR_MAC, "[genann_test] toy network initialized (%d weights)\n", toy_nn->total_weights);
-    }
-
-    /* Basic normalization: keeps both inputs on a comparable scale.
-    * Not critical for this pure-timing test (no training happening),
-    * but important preparation: an un-normalized throughput in raw bps
-    * (up to tens of millions) next to a CQI of 0-15 would completely
-    * dominate the network's behavior once we start real training. */
-    double input[2];
-    input[0] = cand->avg_throughput / 1e6; /* bps -> Mbps-ish scale */
-    input[1] = cand->cqi / 15.0;           /* CQI 0-15 -> 0-1 */
-
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    double const *out = genann_run(toy_nn, input);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-
-    long long elapsed_ns = (t1.tv_sec - t0.tv_sec) * 1000000000LL + (t1.tv_nsec - t0.tv_nsec);
-    genann_total_ns += elapsed_ns;
-    genann_call_count++;
-
-    if (genann_call_count % 128 == 0) {
-      LOG_I(NR_MAC,
-            "[genann_test] call #%d, RNTI %04x, avg_thr=%.3f Mbps, cqi=%d, output=%f, "
-            "last_inference=%lld ns, avg_inference=%lld ns\n",
-            genann_call_count, cand->rnti, cand->avg_throughput / 1e6, cand->cqi, out[0],
-            elapsed_ns, genann_total_ns / genann_call_count);
-    }
-    /* ---- end genann test ---- */
-  }
-
   const int min_rbSize = 5;
   int n_scheduled = 0;
 
@@ -235,8 +267,45 @@ int nr_dl_proportional_fair(const nr_dl_sched_params_t *params, nr_dl_candidate_
   nr_dl_candidate_t *order[MAX_MOBILES_PER_GNB];
   int n_active = 0;
   FOR_EACH_CANDIDATE(cand, candidates, n_candidates)
-  if (!cand->skipped)
+  if (!cand->skipped) {
     order[n_active++] = cand;
+
+      /* Lazy one-time setup: shared network + background thread, started once */
+  if (!shared_nn) {
+    shared_nn = genann_init(2, 1, 8, 1);
+    srand((unsigned)time(NULL)); /* seed rand() once, for batch sampling */
+    LOG_I(NR_MAC, "[genann_test] shared network initialized (%d weights)\n", shared_nn->total_weights);
+  }
+  if (!training_thread_started) {
+    pthread_create(&training_thread_handle, NULL, genann_training_thread, NULL);
+    training_thread_started = 1;
+    LOG_I(NR_MAC, "[genann_test] background training thread started\n");
+  }
+
+  double input[2];
+  input[0] = cand->avg_throughput / 1e6;
+  input[1] = cand->cqi / 15.0;
+
+  /* Inference stays in the real-time path: this is what must never exceed
+   * the slot deadline, as confirmed with the tutor. */
+  double const *out = genann_run(shared_nn, input);
+  (void)out; /* not used yet for any scheduling decision */
+
+  /* Push this (state, target) sample into the replay buffer.
+   * Critical section is kept minimal: just a struct copy, so the
+   * real-time thread is blocked only a handful of nanoseconds even if
+   * the background thread happens to hold the lock at the same time. */
+  replay_sample_t sample;
+  sample.state[0] = input[0];
+  sample.state[1] = input[1];
+  sample.target[0] = 0.5; /* placeholder target, until a real reward exists */
+
+  pthread_mutex_lock(&replay_mutex);
+  replay_buffer[replay_write_idx] = sample;
+  replay_write_idx = (replay_write_idx + 1) % REPLAY_BUFFER_CAPACITY;
+  if (replay_count < REPLAY_BUFFER_CAPACITY) replay_count++;
+  pthread_mutex_unlock(&replay_mutex);
+  }
   qsort(order, n_active, sizeof(*order), compare_dl_pf_rb_ptrs);
 
   /* Phase 1: HARQ retransmissions (highest priority, exact RBs) */
