@@ -32,6 +32,7 @@
 
 #define REPLAY_BUFFER_CAPACITY 10000  /* how much history the buffer holds */
 #define TRAIN_BATCH_SIZE 32          /* how many random samples per training round */
+#define PENDING_TABLE_SIZE 64
 
 /* One replay entry = one (state, target) pair captured from one slot.
  * "target" is a placeholder for now (fixed 0.5) until a real reward
@@ -39,7 +40,18 @@
 typedef struct {
   double state[2];   /* avg_throughput (normalized), cqi (normalized) */
   double target[1];  /* placeholder training target */
+  long long write_time_ns; /* CLOCK_MONOTONIC timestamp at the moment this sample was written */
 } replay_sample_t;
+
+/* One pending entry = one action taken, waiting for its ACK/NACK outcome.
+ * Correlated by RNTI only (see limitation note: with several HARQ
+ * processes in flight per UE, this may occasionally match the wrong
+ * specific transmission - acceptable simplification for now). */
+typedef struct {
+  int valid;
+  uint16_t rnti;
+  double state[2];
+} pending_transition_t;
 
 static replay_sample_t replay_buffer[REPLAY_BUFFER_CAPACITY];
 static int replay_write_idx = 0;   /* next slot to write into (circular) */
@@ -49,6 +61,9 @@ static pthread_mutex_t replay_mutex = PTHREAD_MUTEX_INITIALIZER;
 static genann *shared_nn = NULL;
 static pthread_t training_thread_handle;
 static int training_thread_started = 0;
+
+static pending_transition_t pending_table[PENDING_TABLE_SIZE];
+static pthread_mutex_t pending_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* ==================== background training thread ==================== */
 /* Runs independently of the real-time scheduler loop. Wakes up periodically,
@@ -82,6 +97,19 @@ static void *genann_training_thread(void *arg) {
       continue; /* buffer not filled enough yet, wait for more data */
     }
 
+    struct timespec sample_now_ts;
+    clock_gettime(CLOCK_MONOTONIC, &sample_now_ts);
+    long long now_ns = sample_now_ts.tv_sec * 1000000000LL + sample_now_ts.tv_nsec;
+
+    long long age_min_ns = -1, age_max_ns = -1, age_sum_ns = 0;
+    for (int i = 0; i < TRAIN_BATCH_SIZE; i++) {
+      long long age_ns = now_ns - batch[i].write_time_ns;
+      if (age_min_ns < 0 || age_ns < age_min_ns) age_min_ns = age_ns;
+      if (age_ns > age_max_ns) age_max_ns = age_ns;
+      age_sum_ns += age_ns;
+    }
+    long long age_avg_ns = age_sum_ns / TRAIN_BATCH_SIZE;
+
     /* Actual training happens outside the lock, on our local copy of the
      * batch. This is where the "no lock on weights" trade-off applies:
      * the real-time thread may call genann_run() concurrently while we
@@ -95,11 +123,89 @@ static void *genann_training_thread(void *arg) {
 
     long long elapsed_ns = (bt1.tv_sec - bt0.tv_sec) * 1000000000LL + (bt1.tv_nsec - bt0.tv_nsec);
     LOG_I(NR_MAC,
-          "[genann_test] BACKGROUND TRAIN: batch=%d, took=%lld ns, buffer_fill=%d/%d\n",
-          TRAIN_BATCH_SIZE, elapsed_ns, available, REPLAY_BUFFER_CAPACITY);
+          "[genann_test] BACKGROUND TRAIN: batch=%d, took=%lld ns, buffer_fill=%d/%d, "
+          "sample_age_avg=%.2f ms, sample_age_min=%.2f ms, sample_age_max=%.2f ms\n",
+          TRAIN_BATCH_SIZE, elapsed_ns, available, REPLAY_BUFFER_CAPACITY,
+          age_avg_ns / 1e6, age_min_ns / 1e6, age_max_ns / 1e6);
   }
 
   return NULL; /* never reached in practice, thread runs forever */
+}
+
+/* Remembers the state used for this action, so the delayed ACK/NACK
+ * (arriving a few slots later, from handle_dl_harq()) can be matched
+ * back to it later. */
+static void genann_push_pending(uint16_t rnti, double s0, double s1) {
+  pthread_mutex_lock(&pending_mutex);
+
+  int idx = -1;
+  for (int i = 0; i < PENDING_TABLE_SIZE; i++) {
+    if (pending_table[i].valid && pending_table[i].rnti == rnti) { idx = i; break; }
+  }
+  if (idx < 0) {
+    for (int i = 0; i < PENDING_TABLE_SIZE; i++) {
+      if (!pending_table[i].valid) { idx = i; break; }
+    }
+    if (idx < 0) idx = 0; /* table full: reuse slot 0 (instrumentation-grade fallback) */
+  }
+
+  pending_table[idx].valid = 1;
+  pending_table[idx].rnti = rnti;
+  pending_table[idx].state[0] = s0;
+  pending_table[idx].state[1] = s1;
+
+  pthread_mutex_unlock(&pending_mutex);
+}
+
+/* Called from handle_dl_harq() (gNB_scheduler_uci.c) once the real
+ * ACK/NACK is known. Looks up the pending action, attaches the binary
+ * success/failure reward, and pushes the COMPLETE transition into the
+ * same replay buffer the background training thread already reads from. */
+void genann_report_harq_result(uint16_t rnti, bool success) {
+  double s0 = 0, s1 = 0;
+  int found = 0;
+
+  pthread_mutex_lock(&pending_mutex);
+  for (int i = 0; i < PENDING_TABLE_SIZE; i++) {
+    if (pending_table[i].valid && pending_table[i].rnti == rnti) {
+      s0 = pending_table[i].state[0];
+      s1 = pending_table[i].state[1];
+      pending_table[i].valid = 0;
+      found = 1;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&pending_mutex);
+
+  if (!found)
+    return; /* no matching pending action - e.g. before the first scheduling decision ever made */
+
+  replay_sample_t sample;
+  sample.state[0] = s0;
+  sample.state[1] = s1;
+  sample.target[0] = success ? 1.0 : 0.0; /* the real reward: 1 = ACK, 0 = NACK */
+
+  struct timespec now_ts;
+  clock_gettime(CLOCK_MONOTONIC, &now_ts);
+  sample.write_time_ns = now_ts.tv_sec * 1000000000LL + now_ts.tv_nsec;
+
+  static long long reward_success_count = 0;
+  static long long reward_total_count = 0;
+  reward_total_count++;
+  if (success) reward_success_count++;
+
+  if (reward_total_count % 128 == 0) {
+    LOG_I(NR_MAC,
+          "[genann_test] REWARD call #%lld, RNTI %04x, success=%d, success_rate=%.2f%%\n",
+          reward_total_count, rnti, success,
+          100.0 * reward_success_count / reward_total_count);
+  }
+
+  pthread_mutex_lock(&replay_mutex);
+  replay_buffer[replay_write_idx] = sample;
+  replay_write_idx = (replay_write_idx + 1) % REPLAY_BUFFER_CAPACITY;
+  if (replay_count < REPLAY_BUFFER_CAPACITY) replay_count++;
+  pthread_mutex_unlock(&replay_mutex);
 }
 
 // Default RI/PMI selector: reads rank and PMI from CSI feedback for new-tx,
@@ -288,23 +394,32 @@ int nr_dl_proportional_fair(const nr_dl_sched_params_t *params, nr_dl_candidate_
 
   /* Inference stays in the real-time path: this is what must never exceed
    * the slot deadline, as confirmed with the tutor. */
+  static long long inference_total_ns = 0;
+  static int inference_call_count = 0;
+
+  struct timespec it0, it1;
+  clock_gettime(CLOCK_MONOTONIC, &it0);
   double const *out = genann_run(shared_nn, input);
+  clock_gettime(CLOCK_MONOTONIC, &it1);
   (void)out; /* not used yet for any scheduling decision */
 
-  /* Push this (state, target) sample into the replay buffer.
-   * Critical section is kept minimal: just a struct copy, so the
-   * real-time thread is blocked only a handful of nanoseconds even if
-   * the background thread happens to hold the lock at the same time. */
-  replay_sample_t sample;
-  sample.state[0] = input[0];
-  sample.state[1] = input[1];
-  sample.target[0] = 0.5; /* placeholder target, until a real reward exists */
+  long long inf_elapsed_ns = (it1.tv_sec - it0.tv_sec) * 1000000000LL + (it1.tv_nsec - it0.tv_nsec);
+  inference_total_ns += inf_elapsed_ns;
+  inference_call_count++;
 
-  pthread_mutex_lock(&replay_mutex);
-  replay_buffer[replay_write_idx] = sample;
-  replay_write_idx = (replay_write_idx + 1) % REPLAY_BUFFER_CAPACITY;
-  if (replay_count < REPLAY_BUFFER_CAPACITY) replay_count++;
-  pthread_mutex_unlock(&replay_mutex);
+  if (inference_call_count % 128 == 0) {
+    LOG_I(NR_MAC,
+          "[genann_test] INFERENCE call #%d, avg_inference=%lld ns\n",
+          inference_call_count, inference_total_ns / inference_call_count);
+  }
+
+  struct timespec now_ts;
+  clock_gettime(CLOCK_MONOTONIC, &now_ts);
+
+  /* Don't push to the replay buffer yet - we don't know the outcome.
+   * Remember this action instead; genann_report_harq_result() will
+   * complete it later once the real ACK/NACK arrives. */
+  genann_push_pending(cand->rnti, input[0], input[1]);
   }
   qsort(order, n_active, sizeof(*order), compare_dl_pf_rb_ptrs);
 

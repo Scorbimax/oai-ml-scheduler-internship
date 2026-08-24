@@ -16,6 +16,7 @@
 #include "common/utils/T/T.h"
 #include "common/utils/nr/nr_common.h"
 #include "nfapi/oai_integration/vendor_ext.h"
+#include "gNB_scheduler_dlsch_default_policies.h"
 static void nr_fill_nfapi_pucch(gNB_MAC_INST *nrmac, frame_t frame, slot_t slot, const NR_sched_pucch_t *pucch, NR_UE_info_t* UE)
 {
 
@@ -369,6 +370,10 @@ static void handle_dl_harq(gNB_MAC_INST *mac, NR_UE_info_t * UE, int8_t harq_pid
   NR_UE_harq_t *harq = &sched_ctrl->harq_processes[harq_pid];
   harq->feedback_slot = -1;
   harq->is_waiting = false;
+
+  /* genann test: report this ACK/NACK as the reward for the pending action */
+  genann_report_harq_result(UE->rnti, success);
+
   if (success) {
     if (harq->sched_pdsch.action)
       harq->sched_pdsch.action(mac, UE);
