@@ -62,9 +62,6 @@ static genann *shared_nn = NULL;
 static pthread_t training_thread_handle;
 static int training_thread_started = 0;
 
-static pending_transition_t pending_table[PENDING_TABLE_SIZE];
-static pthread_mutex_t pending_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 /* ==================== background training thread ==================== */
 /* Runs independently of the real-time scheduler loop. Wakes up periodically,
  * and if enough samples are available, draws a random batch and trains on it.
@@ -344,9 +341,6 @@ int nr_dl_proportional_fair(const nr_dl_sched_params_t *params, nr_dl_candidate_
   sample.state[0] = input[0];
   sample.state[1] = input[1];
   sample.target[0] = 1.0 - cand->bler; /* real reward: 1.0 = perfect, 0.0 = total failure */
-
-  struct timespec now_ts;
-  clock_gettime(CLOCK_MONOTONIC, &now_ts);
   sample.write_time_ns = now_ts.tv_sec * 1000000000LL + now_ts.tv_nsec;
 
   pthread_mutex_lock(&replay_mutex);
