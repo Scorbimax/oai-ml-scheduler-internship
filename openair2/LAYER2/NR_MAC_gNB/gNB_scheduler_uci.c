@@ -371,9 +371,6 @@ static void handle_dl_harq(gNB_MAC_INST *mac, NR_UE_info_t * UE, int8_t harq_pid
   harq->feedback_slot = -1;
   harq->is_waiting = false;
 
-  /* genann test: report this ACK/NACK as the reward for the pending action */
-  genann_report_harq_result(UE->rnti, success);
-
   if (success) {
     if (harq->sched_pdsch.action)
       harq->sched_pdsch.action(mac, UE);

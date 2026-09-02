@@ -132,82 +132,6 @@ static void *genann_training_thread(void *arg) {
   return NULL; /* never reached in practice, thread runs forever */
 }
 
-/* Remembers the state used for this action, so the delayed ACK/NACK
- * (arriving a few slots later, from handle_dl_harq()) can be matched
- * back to it later. */
-static void genann_push_pending(uint16_t rnti, double s0, double s1) {
-  pthread_mutex_lock(&pending_mutex);
-
-  int idx = -1;
-  for (int i = 0; i < PENDING_TABLE_SIZE; i++) {
-    if (pending_table[i].valid && pending_table[i].rnti == rnti) { idx = i; break; }
-  }
-  if (idx < 0) {
-    for (int i = 0; i < PENDING_TABLE_SIZE; i++) {
-      if (!pending_table[i].valid) { idx = i; break; }
-    }
-    if (idx < 0) idx = 0; /* table full: reuse slot 0 (instrumentation-grade fallback) */
-  }
-
-  pending_table[idx].valid = 1;
-  pending_table[idx].rnti = rnti;
-  pending_table[idx].state[0] = s0;
-  pending_table[idx].state[1] = s1;
-
-  pthread_mutex_unlock(&pending_mutex);
-}
-
-/* Called from handle_dl_harq() (gNB_scheduler_uci.c) once the real
- * ACK/NACK is known. Looks up the pending action, attaches the binary
- * success/failure reward, and pushes the COMPLETE transition into the
- * same replay buffer the background training thread already reads from. */
-void genann_report_harq_result(uint16_t rnti, bool success) {
-  double s0 = 0, s1 = 0;
-  int found = 0;
-
-  pthread_mutex_lock(&pending_mutex);
-  for (int i = 0; i < PENDING_TABLE_SIZE; i++) {
-    if (pending_table[i].valid && pending_table[i].rnti == rnti) {
-      s0 = pending_table[i].state[0];
-      s1 = pending_table[i].state[1];
-      pending_table[i].valid = 0;
-      found = 1;
-      break;
-    }
-  }
-  pthread_mutex_unlock(&pending_mutex);
-
-  if (!found)
-    return; /* no matching pending action - e.g. before the first scheduling decision ever made */
-
-  replay_sample_t sample;
-  sample.state[0] = s0;
-  sample.state[1] = s1;
-  sample.target[0] = success ? 1.0 : 0.0; /* the real reward: 1 = ACK, 0 = NACK */
-
-  struct timespec now_ts;
-  clock_gettime(CLOCK_MONOTONIC, &now_ts);
-  sample.write_time_ns = now_ts.tv_sec * 1000000000LL + now_ts.tv_nsec;
-
-  static long long reward_success_count = 0;
-  static long long reward_total_count = 0;
-  reward_total_count++;
-  if (success) reward_success_count++;
-
-  if (reward_total_count % 128 == 0) {
-    LOG_I(NR_MAC,
-          "[genann_test] REWARD call #%lld, RNTI %04x, success=%d, success_rate=%.2f%%\n",
-          reward_total_count, rnti, success,
-          100.0 * reward_success_count / reward_total_count);
-  }
-
-  pthread_mutex_lock(&replay_mutex);
-  replay_buffer[replay_write_idx] = sample;
-  replay_write_idx = (replay_write_idx + 1) % REPLAY_BUFFER_CAPACITY;
-  if (replay_count < REPLAY_BUFFER_CAPACITY) replay_count++;
-  pthread_mutex_unlock(&replay_mutex);
-}
-
 // Default RI/PMI selector: reads rank and PMI from CSI feedback for new-tx,
 // or from HARQ process state for retx.
 void nr_dl_ri_pmi_select_default(const gNB_MAC_INST *mac, nr_dl_candidate_t *candidates, int n_candidates)
@@ -416,10 +340,25 @@ int nr_dl_proportional_fair(const nr_dl_sched_params_t *params, nr_dl_candidate_
   struct timespec now_ts;
   clock_gettime(CLOCK_MONOTONIC, &now_ts);
 
-  /* Don't push to the replay buffer yet - we don't know the outcome.
-   * Remember this action instead; genann_report_harq_result() will
-   * complete it later once the real ACK/NACK arrives. */
-  genann_push_pending(cand->rnti, input[0], input[1]);
+  replay_sample_t sample;
+  sample.state[0] = input[0];
+  sample.state[1] = input[1];
+  sample.target[0] = 1.0 - cand->bler; /* real reward: 1.0 = perfect, 0.0 = total failure */
+
+  struct timespec now_ts;
+  clock_gettime(CLOCK_MONOTONIC, &now_ts);
+  sample.write_time_ns = now_ts.tv_sec * 1000000000LL + now_ts.tv_nsec;
+
+  pthread_mutex_lock(&replay_mutex);
+  replay_buffer[replay_write_idx] = sample;
+  replay_write_idx = (replay_write_idx + 1) % REPLAY_BUFFER_CAPACITY;
+  if (replay_count < REPLAY_BUFFER_CAPACITY) replay_count++;
+  pthread_mutex_unlock(&replay_mutex);
+
+  if (inference_call_count % 128 == 0) {
+    LOG_I(NR_MAC, "[genann_test] REWARD (bler-based) RNTI %04x, bler=%.5f, reward=%.5f\n",
+          cand->rnti, cand->bler, sample.target[0]);
+  }
   }
   qsort(order, n_active, sizeof(*order), compare_dl_pf_rb_ptrs);
 

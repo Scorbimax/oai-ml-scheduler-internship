@@ -27,6 +27,4 @@ void nr_dl_lcid_alloc_default(const gNB_MAC_INST *mac,
                               int tbs_available,
                               int lcid_alloc[NR_MAX_NUM_LCID]);
 
-void genann_report_harq_result(uint16_t rnti, bool success);
-
 #endif /* GNB_SCHEDULER_DLSCH_DEFAULT_POLICIES_H */
