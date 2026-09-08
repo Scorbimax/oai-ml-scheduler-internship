@@ -7,6 +7,10 @@
 
 #include "LAYER2/NR_MAC_gNB/nr_mac_gNB.h"
 
+void genann_push_pending(uint16_t rnti, int8_t harq_pid, double s0, double s1);
+
+void genann_report_harq_result(uint16_t rnti, int8_t harq_pid, bool success);
+
 void nr_dl_ri_pmi_select_default(const gNB_MAC_INST *mac, nr_dl_candidate_t *candidates, int n_candidates);
 void nr_dl_mcs_select_default(const gNB_MAC_INST *mac, nr_dl_candidate_t *candidates, int n_candidates);
 
@@ -26,7 +30,5 @@ void nr_dl_lcid_alloc_default(const gNB_MAC_INST *mac,
                               const nr_dl_candidate_t *candidate,
                               int tbs_available,
                               int lcid_alloc[NR_MAX_NUM_LCID]);
-
-void genann_report_harq_result(uint16_t rnti, bool success);
 
 #endif /* GNB_SCHEDULER_DLSCH_DEFAULT_POLICIES_H */

@@ -20,6 +20,8 @@
 #include "executables/softmodem-common.h"
 #include "../../../nfapi/oai_integration/vendor_ext.h"
 
+#include "gNB_scheduler_dlsch_default_policies.h"
+
 ////////////////////////////////////////////////////////
 /////* DLSCH MAC PDU generation (6.1.2 TS 38.321) */////
 ////////////////////////////////////////////////////////
@@ -820,6 +822,7 @@ static void nr_dl_schedule(gNB_MAC_INST *mac,
       sched_pdsch.Qm = harq_pdsch.Qm;
       sched_pdsch.tb_size = harq_pdsch.tb_size;
       sched_pdsch.dl_harq_pid = cand->retx_harq_pid;
+      genann_push_pending(UE->rnti, sched_pdsch.dl_harq_pid, cand->avg_throughput / 1e6, cand->cqi / 15.0);
       sched_pdsch.ant_port_idx = harq_pdsch.ant_port_idx;
       bool tda_changed = sched_pdsch.tda_info.startSymbolIndex != harq_pdsch.tda_info.startSymbolIndex
                          || sched_pdsch.tda_info.nrOfSymbols != harq_pdsch.tda_info.nrOfSymbols;
@@ -838,6 +841,7 @@ static void nr_dl_schedule(gNB_MAC_INST *mac,
       sched_pdsch.R = R;
       sched_pdsch.Qm = Qm;
       sched_pdsch.dl_harq_pid = sched_ctrl->available_dl_harq.head;
+      genann_push_pending(UE->rnti, sched_pdsch.dl_harq_pid, cand->avg_throughput / 1e6, cand->cqi / 15.0);
       sched_pdsch.dmrs_parms = dmrs;
 
       /* Compute actual TBS (policy allocated max rbSize, nr_find_nb_rb gives actual) */

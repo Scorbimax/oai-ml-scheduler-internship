@@ -50,6 +50,7 @@ typedef struct {
 typedef struct {
   int valid;
   uint16_t rnti;
+  int8_t harq_pid;
   double state[2];
 } pending_transition_t;
 
@@ -135,22 +136,25 @@ static void *genann_training_thread(void *arg) {
 /* Remembers the state used for this action, so the delayed ACK/NACK
  * (arriving a few slots later, from handle_dl_harq()) can be matched
  * back to it later. */
-static void genann_push_pending(uint16_t rnti, double s0, double s1) {
+void genann_push_pending(uint16_t rnti, int8_t harq_pid, double s0, double s1) {
   pthread_mutex_lock(&pending_mutex);
 
   int idx = -1;
   for (int i = 0; i < PENDING_TABLE_SIZE; i++) {
-    if (pending_table[i].valid && pending_table[i].rnti == rnti) { idx = i; break; }
+    if (pending_table[i].valid && pending_table[i].rnti == rnti && pending_table[i].harq_pid == harq_pid) {
+      idx = i; break;
+    }
   }
   if (idx < 0) {
     for (int i = 0; i < PENDING_TABLE_SIZE; i++) {
       if (!pending_table[i].valid) { idx = i; break; }
     }
-    if (idx < 0) idx = 0; /* table full: reuse slot 0 (instrumentation-grade fallback) */
+    if (idx < 0) idx = 0;
   }
 
   pending_table[idx].valid = 1;
   pending_table[idx].rnti = rnti;
+  pending_table[idx].harq_pid = harq_pid;
   pending_table[idx].state[0] = s0;
   pending_table[idx].state[1] = s1;
 
@@ -161,13 +165,13 @@ static void genann_push_pending(uint16_t rnti, double s0, double s1) {
  * ACK/NACK is known. Looks up the pending action, attaches the binary
  * success/failure reward, and pushes the COMPLETE transition into the
  * same replay buffer the background training thread already reads from. */
-void genann_report_harq_result(uint16_t rnti, bool success) {
+void genann_report_harq_result(uint16_t rnti, int8_t harq_pid, bool success) {
   double s0 = 0, s1 = 0;
   int found = 0;
 
   pthread_mutex_lock(&pending_mutex);
   for (int i = 0; i < PENDING_TABLE_SIZE; i++) {
-    if (pending_table[i].valid && pending_table[i].rnti == rnti) {
+    if (pending_table[i].valid && pending_table[i].rnti == rnti && pending_table[i].harq_pid == harq_pid) {
       s0 = pending_table[i].state[0];
       s1 = pending_table[i].state[1];
       pending_table[i].valid = 0;
@@ -415,11 +419,6 @@ int nr_dl_proportional_fair(const nr_dl_sched_params_t *params, nr_dl_candidate_
 
   struct timespec now_ts;
   clock_gettime(CLOCK_MONOTONIC, &now_ts);
-
-  /* Don't push to the replay buffer yet - we don't know the outcome.
-   * Remember this action instead; genann_report_harq_result() will
-   * complete it later once the real ACK/NACK arrives. */
-  genann_push_pending(cand->rnti, input[0], input[1]);
   }
   qsort(order, n_active, sizeof(*order), compare_dl_pf_rb_ptrs);
 
